@@ -1,0 +1,15 @@
+{
+  "listen": ["0.0.0.0:2052", "0.0.0.0:2082", "0.0.0.0:2086"],
+  "routes": [
+    {"name": "app", "path": "/bridge/app", "backend": "127.0.0.1:2828", "legacy_port": 2828, "proxy_protocol": false}
+  ],
+  "legacy_proxy_path": "/legacy",
+  "legacy_proxy_at_root": true,
+  "require_cloudflare": false,
+  "trusted_proxies": [],
+  "allowed_origins": [],
+  "allowed_hosts": [],
+  "max_connections": 2048,
+  "max_frame_bytes": 1048576,
+  "max_idle_seconds": 120
+}

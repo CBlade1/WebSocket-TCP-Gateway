@@ -1,0 +1,7 @@
+config.json
+*.log
+*.out
+*.test
+coverage.out
+.DS_Store
+.env
