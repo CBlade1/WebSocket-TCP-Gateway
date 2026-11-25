@@ -1,0 +1,22 @@
+[Unit]
+Description=WebSocket to TCP gateway
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ws-gateway
+Group=ws-gateway
+WorkingDirectory=/opt/ws-tcp-gateway
+ExecStart=/opt/ws-tcp-gateway/gateway -config /etc/ws-tcp-gateway/config.json
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+[Install]
+WantedBy=multi-user.target

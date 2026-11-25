@@ -1,15 +1,12 @@
 {
-  "listen": ["0.0.0.0:2052", "0.0.0.0:2082", "0.0.0.0:2086"],
+  "listen": ["127.0.0.1:2052"],
   "routes": [
-    {"name": "app", "path": "/bridge/app", "backend": "127.0.0.1:2828", "legacy_port": 2828, "proxy_protocol": false}
+    {"name": "service", "path": "/ws/service", "target": "127.0.0.1:2828"}
   ],
-  "legacy_proxy_path": "/legacy",
-  "legacy_proxy_at_root": true,
-  "require_cloudflare": false,
-  "trusted_proxies": [],
+  "allowed_hosts": ["localhost:2052"],
   "allowed_origins": [],
-  "allowed_hosts": [],
+  "trusted_proxies": [],
+  "require_trusted_proxy": false,
   "max_connections": 2048,
-  "max_frame_bytes": 1048576,
-  "max_idle_seconds": 120
+  "max_message_bytes": 1048576
 }

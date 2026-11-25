@@ -1,7 +1,5 @@
-config.json
+/config.json
+/gateway
+*.exe
 *.log
-*.out
 *.test
-coverage.out
-.DS_Store
-.env

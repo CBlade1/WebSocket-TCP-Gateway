@@ -1,31 +1,25 @@
-# Security and deployment
+# Deployment and security
 
-A Cloudflare-proxied DNS record and an HTTP WebSocket listener are not sufficient on their own to protect a server. A secure deployment also requires control of origin access and backend ports.
+The gateway is a transport adapter, not a firewall or application authenticator.
 
-## Origin checklist
+## Network boundary
 
-1. Set your gateway hostname to **proxied** (orange cloud) in Cloudflare DNS. Ensure WebSockets are allowed for the zone.
-2. Use a supported HTTP origin port (`2052`, `2082`, `2086` in the example). These are **ws://**, not encrypted TLS listeners.
-3. Restrict inbound traffic to those listeners to Cloudflare's current published IP ranges at the host/cloud firewall. Do this for **IPv4 and IPv6**. Do not assume blocking just one IP family is sufficient.
-4. Set `require_cloudflare: true` and populate `trusted_proxies` with Cloudflare's current CIDR ranges. Obtain them from https://www.cloudflare.com/ips/ . Review ranges periodically. The process will reject non-trusted peers when this option is enabled.
-5. Set `allowed_hosts` to the public hostname and port combinations clients use (for example, `gateway.example.com:2052`). Do not accept arbitrary Host headers in production.
-6. Keep the TCP backend inaccessible from the public Internet. Prefer an actual loopback bind (`127.0.0.1:2828`) rather than `0.0.0.0:2828`; otherwise block the backend's public port at the firewall.
-7. Keep application authentication and authorization in your backend. The proxy is not a substitute for them.
-8. Configure Cloudflare WAF/rate limits for the WebSocket *upgrade* request, and monitor origin connection pressure. WAF rules do not continuously inspect bytes inside an already upgraded socket.
-9. Consider encrypted transport (`wss://`) where possible. Clients requiring `ws://` accept cleartext traffic on the client-to-edge segment. Credentials or sensitive data should not be sent over it.
+- Backend targets must be loopback IP addresses. Remote forwarding and caller-selected destinations are not supported.
+- Default listeners are loopback-only. For a publicly reachable origin, restrict ingress in the host firewall to known reverse-proxy networks and disable direct access to the backend TCP port.
+- `require_trusted_proxy` checks the connecting peer address against `trusted_proxies` and rejects upgrades from other addresses. CIDR lists must be kept current. A local reverse proxy must be explicitly included if used.
+- `allowed_hosts` checks the Host header. `allowed_origins` applies to clients that send an Origin header; it is not authentication, and native clients can omit or forge it.
+- `/healthz` is only a liveness endpoint and may be publicly accessible if the listener is public.
 
-The application only accepts literal loopback upstream IPs to prevent arbitrary-destination proxying. `CF-Connecting-IP` is ignored unless the direct HTTP peer belongs to `trusted_proxies`.
+## Application boundary
 
-## Example systemd deployment
+The gateway does not authenticate users, understand payloads, or authorize operations. Put authentication in the backend protocol or an upstream proxy where appropriate. Avoid using it to expose a privileged local service to untrusted users.
 
-Create a dedicated, unprivileged account, copy the binary to `/usr/local/bin/ws-tcp-gateway`, and install `examples/ws-tcp-gateway.service`. Place configuration under `/etc/ws-tcp-gateway/config.json`, owned by root and readable by the service account. Run `systemctl daemon-reload` and `systemctl enable --now ws-tcp-gateway`. Check `journalctl -u ws-tcp-gateway` for startup failures.
+WebSocket messages are limited by `max_message_bytes`, and simultaneous connections by `max_connections`. Those are process-level safety controls, not distributed denial-of-service defenses. Backends can impose additional per-client limits.
 
-The example config has `require_cloudflare` **off** for localhost experimentation. Make the changes above before publishing an address.
+Traffic sent with `ws://` is not encrypted. For sensitive data, terminate TLS at an appropriately configured proxy and use `wss://` externally. If TLS between edge and origin is required, provide it through a separate local reverse proxy or use a Cloudflare-supported encrypted origin configuration.
 
-## Failure model
+## Lifecycle
 
-- Multi-route legacy session recovery requires compatible client reconnect behavior.
-- The gateway cannot protect exposed services on unrelated ports, volumetric attacks against a known origin, or clients that bypass Cloudflare.
-- No built-in global bandwidth cap is provided; use OS resource controls, edge limits, and monitoring. Limits on upgraded connections and session queues reduce but cannot remove denial-of-service risk.
-- The bridge does not encrypt unencrypted application data.
-- Legacy sessions rely on a 32-bit session ID and originating client IP, not a cryptographic per-session token. Do not treat a session ID as authentication. Use only with trusted application protocols and add application-level authorization.
+The gateway sends ping frames every 25 seconds and requires pong responses within 90 seconds. On disconnect, the corresponding TCP connection closes. There is no durable session, packet acknowledgement, or transparent reconnect. Applications needing reconnection must provide their own session semantics.
+
+Run as an unprivileged user. Use the included systemd unit as a starting point and review its paths and sandboxing before enabling it.

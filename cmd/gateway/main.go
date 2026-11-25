@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -9,8 +10,11 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/netip"
+	"net/url"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -19,293 +23,253 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-type Route struct {
-	Name          string `json:"name"`
-	Path          string `json:"path"`
-	Backend       string `json:"backend"`
-	LegacyPort    uint16 `json:"legacy_port,omitempty"`
-	ProxyProtocol bool   `json:"proxy_protocol,omitempty"`
-}
-type Settings struct {
-	Listen            []string `json:"listen"`
-	Routes            []Route  `json:"routes"`
-	LegacyProxyPath   string   `json:"legacy_proxy_path"`
-	LegacyProxyAtRoot bool     `json:"legacy_proxy_at_root"`
-	RequireCloudflare bool     `json:"require_cloudflare"`
-	TrustedProxies    []string `json:"trusted_proxies"`
-	AllowedOrigins    []string `json:"allowed_origins"`
-	AllowedHosts      []string `json:"allowed_hosts"`
-	MaxConnections    int      `json:"max_connections"`
-	MaxFrameBytes     int64    `json:"max_frame_bytes"`
-	MaxIdleSeconds    int      `json:"max_idle_seconds"`
+const (
+	defaultLimit        = 2048
+	defaultMessageLimit = 1024 * 1024
+	pingInterval        = 25 * time.Second
+	pongTimeout         = 90 * time.Second
+	writeTimeout        = 15 * time.Second
+)
+
+type route struct {
+	Name   string `json:"name"`
+	Path   string `json:"path"`
+	Target string `json:"target"`
 }
 
-var settings Settings
-var trusted []*net.IPNet
-var gate = make(chan struct{}, 10000)
-var proxyProtocolTargets map[string]bool
-var serverMu sync.Mutex
-var allServers []*http.Server
+type config struct {
+	Listen              []string `json:"listen"`
+	Routes              []route  `json:"routes"`
+	AllowedHosts        []string `json:"allowed_hosts"`
+	AllowedOrigins      []string `json:"allowed_origins"`
+	TrustedProxies      []string `json:"trusted_proxies"`
+	RequireTrustedProxy bool     `json:"require_trusted_proxy"`
+	MaxConnections      int      `json:"max_connections"`
+	MaxMessageBytes     int64    `json:"max_message_bytes"`
+}
 
-func loadConfig(filename string) error {
-	b, err := os.ReadFile(filename)
+type gateway struct {
+	cfg      config
+	trusted  []netip.Prefix
+	slots    chan struct{}
+	upgrades websocket.Upgrader
+}
+
+func loadConfig(path string) (config, error) {
+	var cfg config
+	file, err := os.Open(path)
 	if err != nil {
-		return err
+		return cfg, err
 	}
-	dec := json.NewDecoder(strings.NewReader(string(b)))
+	defer file.Close()
+	dec := json.NewDecoder(file)
 	dec.DisallowUnknownFields()
-	if err = dec.Decode(&settings); err != nil {
-		return err
+	if err := dec.Decode(&cfg); err != nil {
+		return cfg, err
 	}
-	if len(settings.Listen) == 0 || len(settings.Routes) == 0 {
-		return errors.New("listen and routes must not be empty")
-	}
-	if settings.LegacyProxyPath == "" {
-		settings.LegacyProxyPath = "/legacy"
-	}
-	if settings.MaxConnections <= 0 {
-		settings.MaxConnections = 2048
-	}
-	if settings.MaxConnections > 10000 {
-		return errors.New("max_connections must be <= 10000")
-	}
-	gate = make(chan struct{}, settings.MaxConnections)
-	if settings.MaxFrameBytes <= 0 {
-		settings.MaxFrameBytes = 1024 * 1024
-	}
-	if settings.MaxFrameBytes > 64*1024*1024 {
-		return errors.New("max_frame_bytes must be <= 64 MiB")
-	}
-	if settings.MaxIdleSeconds <= 0 {
-		settings.MaxIdleSeconds = 120
-	}
-	for _, cidr := range settings.TrustedProxies {
-		_, ipnet, e := net.ParseCIDR(cidr)
-		if e != nil {
-			return fmt.Errorf("trusted proxy %q: %w", cidr, e)
+	var extra any
+	if err := dec.Decode(&extra); err != io.EOF {
+		if err == nil {
+			return cfg, errors.New("unexpected content after configuration")
 		}
-		trusted = append(trusted, ipnet)
+		return cfg, err
 	}
-	if settings.RequireCloudflare && len(trusted) == 0 {
-		return errors.New("require_cloudflare needs trusted_proxies CIDRs; see docs/security.md")
-	}
-	proxyDestinations = make(map[uint16]string)
-	proxyProtocolTargets = make(map[string]bool)
-	seen := map[string]bool{}
-	for _, r := range settings.Routes {
-		if r.Name == "" || !strings.HasPrefix(r.Path, "/") || r.Backend == "" {
-			return fmt.Errorf("route %q: name, absolute path and backend required", r.Name)
-		}
-		if seen[r.Path] || r.Path == settings.LegacyProxyPath || r.Path == "/healthz" {
-			return fmt.Errorf("duplicate or reserved path %q", r.Path)
-		}
-		seen[r.Path] = true
-		host, port, e := net.SplitHostPort(r.Backend)
-		if e != nil || port == "" {
-			return fmt.Errorf("route %q: invalid backend", r.Name)
-		}
-		ip := net.ParseIP(host)
-		if ip == nil || !ip.IsLoopback() {
-			return fmt.Errorf("route %q: backend must be loopback IP to avoid unintended proxying", r.Name)
-		}
-		if r.LegacyPort != 0 {
-			if _, ok := proxyDestinations[r.LegacyPort]; ok {
-				return fmt.Errorf("duplicate legacy port %d", r.LegacyPort)
-			}
-			proxyDestinations[r.LegacyPort] = r.Backend
-		}
-		if r.ProxyProtocol {
-			proxyProtocolTargets[r.Backend] = true
-		}
-	}
-	for _, listen := range settings.Listen {
-		if _, _, e := net.SplitHostPort(listen); e != nil {
-			return fmt.Errorf("bad listener %q: %w", listen, e)
-		}
-	}
-	return nil
+	return cfg, nil
 }
 
-func trustedPeer(r *http.Request) bool {
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		return false
+func newGateway(cfg config) (*gateway, error) {
+	if len(cfg.Listen) == 0 || len(cfg.Routes) == 0 {
+		return nil, errors.New("listen and routes must not be empty")
 	}
-	ip := net.ParseIP(host)
-	if ip == nil {
-		return false
+	if cfg.MaxConnections == 0 {
+		cfg.MaxConnections = defaultLimit
 	}
-	for _, n := range trusted {
-		if n.Contains(ip) {
-			return true
+	if cfg.MaxConnections < 1 || cfg.MaxConnections > 100000 {
+		return nil, errors.New("max_connections must be between 1 and 100000")
+	}
+	if cfg.MaxMessageBytes == 0 {
+		cfg.MaxMessageBytes = defaultMessageLimit
+	}
+	if cfg.MaxMessageBytes < 1 || cfg.MaxMessageBytes > 64*1024*1024 {
+		return nil, errors.New("max_message_bytes must be between 1 and 67108864")
+	}
+	seenListen := map[string]bool{}
+	for _, addr := range cfg.Listen {
+		if _, _, err := net.SplitHostPort(addr); err != nil {
+			return nil, fmt.Errorf("listener %q: %w", addr, err)
+		}
+		if seenListen[addr] {
+			return nil, fmt.Errorf("duplicate listener: %s", addr)
+		}
+		seenListen[addr] = true
+	}
+	seenPath := map[string]bool{}
+	for _, r := range cfg.Routes {
+		if r.Name == "" || r.Path == "" || r.Target == "" {
+			return nil, errors.New("route name, path and target are required")
+		}
+		if r.Path == "/healthz" || !strings.HasPrefix(r.Path, "/") || strings.ContainsAny(r.Path, "?#") {
+			return nil, fmt.Errorf("invalid route path %q", r.Path)
+		}
+		if seenPath[r.Path] {
+			return nil, fmt.Errorf("duplicate route path %q", r.Path)
+		}
+		seenPath[r.Path] = true
+		host, port, err := net.SplitHostPort(r.Target)
+		if err != nil {
+			return nil, fmt.Errorf("route %q: invalid TCP target: %w", r.Name, err)
+		}
+		ip, err := netip.ParseAddr(host)
+		if err != nil || !ip.IsLoopback() {
+			return nil, fmt.Errorf("route %q: TCP target must be a loopback IP", r.Name)
+		}
+		n, err := strconv.Atoi(port)
+		if err != nil || n < 1 || n > 65535 {
+			return nil, fmt.Errorf("route %q: invalid target port", r.Name)
 		}
 	}
-	return false
-}
-func clientIPFromTrustedRequest(r *http.Request) string {
-	if trustedPeer(r) {
-		if v := strings.TrimSpace(r.Header.Get("CF-Connecting-IP")); v != "" {
-			if ip := net.ParseIP(v); ip != nil {
-				return ip.String()
-			}
+	trusted := make([]netip.Prefix, 0, len(cfg.TrustedProxies))
+	for _, cidr := range cfg.TrustedProxies {
+		prefix, err := netip.ParsePrefix(cidr)
+		if err != nil {
+			return nil, fmt.Errorf("invalid trusted proxy CIDR %q: %w", cidr, err)
+		}
+		trusted = append(trusted, prefix.Masked())
+	}
+	if cfg.RequireTrustedProxy && len(trusted) == 0 {
+		return nil, errors.New("require_trusted_proxy needs trusted_proxies")
+	}
+	for _, s := range cfg.AllowedOrigins {
+		u, err := url.Parse(s)
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.User != nil || u.Path != "" || u.RawQuery != "" || u.Fragment != "" {
+			return nil, fmt.Errorf("invalid origin %q: use scheme://host[:port]", s)
 		}
 	}
-	host, _, e := net.SplitHostPort(r.RemoteAddr)
-	if e != nil {
-		return r.RemoteAddr
-	}
-	return host
+	g := &gateway{cfg: cfg, trusted: trusted, slots: make(chan struct{}, cfg.MaxConnections)}
+	g.upgrades = websocket.Upgrader{ReadBufferSize: 4096, WriteBufferSize: 4096, EnableCompression: false, CheckOrigin: g.originAllowed}
+	return g, nil
 }
-func allowUpgrade(r *http.Request) bool {
-	if settings.RequireCloudflare && !trustedPeer(r) {
-		return false
-	}
-	if len(settings.AllowedHosts) > 0 {
-		for _, host := range settings.AllowedHosts {
-			if strings.EqualFold(r.Host, host) {
-				return true
-			}
-		}
-		return false
-	}
-	return true
-}
-func permittedOrigin(r *http.Request) bool {
+
+func (g *gateway) originAllowed(r *http.Request) bool {
 	origin := r.Header.Get("Origin")
 	if origin == "" {
 		return true
-	} // native clients normally have no Origin header
-	for _, allowed := range settings.AllowedOrigins {
+	} // Native WS clients often do not send Origin.
+	for _, allowed := range g.cfg.AllowedOrigins {
 		if origin == allowed {
 			return true
 		}
 	}
 	return false
 }
-func shouldSendProxyHeader(target string) bool { return proxyProtocolTargets[target] }
-func maxWSMessage() int64                      { return settings.MaxFrameBytes }
 
-func handler() http.Handler {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			w.WriteHeader(405)
-			return
-		}
-		w.WriteHeader(200)
-		_, _ = w.Write([]byte("ok\n"))
-	})
-	for _, route := range settings.Routes {
-		r := route
-		mux.HandleFunc(r.Path, func(w http.ResponseWriter, req *http.Request) { rawBridge(w, req, r) })
+func (g *gateway) fromTrustedPeer(r *http.Request) bool {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return false
 	}
-	legacyHandler := handleProxyWebSocket()
-	mux.HandleFunc(settings.LegacyProxyPath, func(w http.ResponseWriter, r *http.Request) {
-		if !admit(w, r) {
-			return
-		}
-		defer release()
-		legacyHandler(w, r)
-	})
-	if settings.LegacyProxyAtRoot {
-		mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-			if r.URL.Path != "/" {
-				http.NotFound(w, r)
-				return
-			}
-			if !admit(w, r) {
-				return
-			}
-			defer release()
-			legacyHandler(w, r)
-		})
+	addr, err := netip.ParseAddr(host)
+	if err != nil {
+		return false
 	}
-	return mux
+	addr = addr.Unmap()
+	for _, prefix := range g.trusted {
+		if prefix.Contains(addr) {
+			return true
+		}
+	}
+	return false
 }
-func admit(w http.ResponseWriter, r *http.Request) bool {
-	if r.Method != http.MethodGet || !websocket.IsWebSocketUpgrade(r) {
-		http.Error(w, "websocket upgrade required", 400)
-		return false
-	}
-	if !allowUpgrade(r) {
-		http.Error(w, "untrusted origin", 403)
-		return false
-	}
-	if !permittedOrigin(r) {
-		http.Error(w, "origin denied", 403)
-		return false
-	}
-	select {
-	case gate <- struct{}{}:
+
+func (g *gateway) permittedHost(host string) bool {
+	if len(g.cfg.AllowedHosts) == 0 {
 		return true
-	default:
-		http.Error(w, "capacity reached", 503)
-		return false
 	}
+	for _, allowed := range g.cfg.AllowedHosts {
+		if strings.EqualFold(host, allowed) {
+			return true
+		}
+	}
+	return false
 }
-func release() { <-gate }
 
-func rawBridge(w http.ResponseWriter, r *http.Request, route Route) {
-	if !admit(w, r) {
+func (g *gateway) handleUpgrade(w http.ResponseWriter, r *http.Request, rt route) {
+	if r.Method != http.MethodGet || !websocket.IsWebSocketUpgrade(r) {
+		http.Error(w, "websocket upgrade required", http.StatusBadRequest)
 		return
 	}
-	defer release()
-	ws, err := upgrader.Upgrade(w, r, nil)
+	if !g.permittedHost(r.Host) {
+		http.Error(w, "host not allowed", http.StatusForbidden)
+		return
+	}
+	if g.cfg.RequireTrustedProxy && !g.fromTrustedPeer(r) {
+		http.Error(w, "proxy required", http.StatusForbidden)
+		return
+	}
+	if !g.originAllowed(r) {
+		http.Error(w, "origin not allowed", http.StatusForbidden)
+		return
+	}
+	select {
+	case g.slots <- struct{}{}:
+		defer func() { <-g.slots }()
+	default:
+		http.Error(w, "connection limit reached", http.StatusServiceUnavailable)
+		return
+	}
+
+	// Connect before upgrading so failed targets produce a useful HTTP response.
+	tcp, err := net.DialTimeout("tcp", rt.Target, 3*time.Second)
+	if err != nil {
+		http.Error(w, "target unavailable", http.StatusBadGateway)
+		return
+	}
+	defer tcp.Close()
+	if c, ok := tcp.(*net.TCPConn); ok {
+		_ = c.SetNoDelay(true)
+		_ = c.SetKeepAlive(true)
+	}
+
+	ws, err := g.upgrades.Upgrade(w, r, nil)
 	if err != nil {
 		return
 	}
 	defer ws.Close()
 	ws.EnableWriteCompression(false)
-	ws.SetReadLimit(settings.MaxFrameBytes)
-	clientIP := clientIPFromTrustedRequest(r)
-	backend, err := net.DialTimeout("tcp", route.Backend, 5*time.Second)
-	if err != nil {
-		_ = ws.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(1011, "backend unavailable"), time.Now().Add(time.Second))
-		return
-	}
-	defer backend.Close()
-	if tcp, ok := backend.(*net.TCPConn); ok {
-		_ = tcp.SetNoDelay(true)
-		_ = tcp.SetKeepAlive(true)
-	}
-	if route.ProxyProtocol {
-		header := buildPROXYv2Header(clientIP, route.Backend)
-		if len(header) == 0 || writeAll(backend, header) != nil {
-			return
-		}
-	}
-	end := make(chan struct{})
-	var once sync.Once
-	stop := func() { once.Do(func() { close(end); _ = backend.Close(); _ = ws.Close() }) }
-	ws.SetReadLimit(settings.MaxFrameBytes)
-	_ = ws.SetReadDeadline(time.Now().Add(time.Duration(settings.MaxIdleSeconds) * time.Second))
-	ws.SetPongHandler(func(string) error {
-		return ws.SetReadDeadline(time.Now().Add(time.Duration(settings.MaxIdleSeconds) * time.Second))
-	})
+	ws.SetReadLimit(g.cfg.MaxMessageBytes)
+	_ = ws.SetReadDeadline(time.Now().Add(pongTimeout))
+	ws.SetPongHandler(func(string) error { return ws.SetReadDeadline(time.Now().Add(pongTimeout)) })
+
+	done := make(chan struct{})
+	var closeOnce sync.Once
+	stop := func() { closeOnce.Do(func() { close(done); _ = tcp.Close(); _ = ws.Close() }) }
+	defer stop()
+
+	// One reader and one data writer per WebSocket. Control frames may be sent concurrently.
 	go func() {
 		defer stop()
 		for {
-			typ, reader, e := ws.NextReader()
-			if e != nil {
+			kind, msg, err := ws.NextReader()
+			if err != nil {
 				return
 			}
-			if typ != websocket.BinaryMessage {
-				continue
+			if kind != websocket.BinaryMessage {
+				return
 			}
-			if _, e = copyLimit(backend, reader, settings.MaxFrameBytes); e != nil {
+			if _, err := io.CopyBuffer(tcp, msg, make([]byte, 32*1024)); err != nil {
 				return
 			}
 		}
 	}()
 	go func() {
-		ticker := time.NewTicker(25 * time.Second)
+		ticker := time.NewTicker(pingInterval)
 		defer ticker.Stop()
 		for {
 			select {
-			case <-end:
+			case <-done:
 				return
 			case <-ticker.C:
-				if ws.WriteControl(websocket.PingMessage, nil, time.Now().Add(5*time.Second)) != nil {
+				if err := ws.WriteControl(websocket.PingMessage, nil, time.Now().Add(5*time.Second)); err != nil {
 					stop()
 					return
 				}
@@ -314,59 +278,85 @@ func rawBridge(w http.ResponseWriter, r *http.Request, route Route) {
 	}()
 	buf := make([]byte, 32*1024)
 	for {
-		n, e := backend.Read(buf)
+		n, err := tcp.Read(buf)
 		if n > 0 {
-			if ws.SetWriteDeadline(time.Now().Add(15*time.Second)) != nil || ws.WriteMessage(websocket.BinaryMessage, buf[:n]) != nil {
-				break
+			if e := ws.SetWriteDeadline(time.Now().Add(writeTimeout)); e != nil {
+				return
+			}
+			if e := ws.WriteMessage(websocket.BinaryMessage, buf[:n]); e != nil {
+				return
 			}
 		}
-		if e != nil {
-			break
+		if err != nil {
+			return
 		}
 	}
-	stop()
 }
-func copyLimit(dst net.Conn, src io.Reader, limit int64) (int64, error) {
-	// The WebSocket library enforces the message read limit. This additional
-	// bound protects callers that replace the WebSocket reader in the future.
-	n, err := io.CopyBuffer(dst, io.LimitReader(src, limit+1), make([]byte, 32*1024))
-	if n > limit {
-		return n, fmt.Errorf("websocket message exceeds limit")
+
+func (g *gateway) handler() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		// This is a process liveness check, not a check of every configured target.
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		_, _ = w.Write([]byte("ok\n"))
+	})
+	for _, rt := range g.cfg.Routes {
+		routeCopy := rt
+		mux.HandleFunc(routeCopy.Path, func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path != routeCopy.Path {
+				http.NotFound(w, r)
+				return
+			}
+			g.handleUpgrade(w, r, routeCopy)
+		})
 	}
-	return n, err
+	return mux
 }
 
 func main() {
-	configFile := flag.String("config", "config.json", "configuration file")
+	path := flag.String("config", "config.json", "JSON configuration file")
 	flag.Parse()
-	if e := loadConfig(*configFile); e != nil {
-		log.Fatal(e)
+	cfg, err := loadConfig(*path)
+	if err != nil {
+		log.Fatal(err)
 	}
-	serverHandler := handler()
-	for _, addr := range settings.Listen {
-		listener, e := net.Listen("tcp", addr)
-		if e != nil {
-			for _, srv := range allServers {
-				_ = srv.Close()
+	g, err := newGateway(cfg)
+	if err != nil {
+		log.Fatal(err)
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	servers := make([]*http.Server, 0, len(cfg.Listen))
+	listeners := make([]net.Listener, 0, len(cfg.Listen))
+	for _, addr := range cfg.Listen {
+		ln, err := net.Listen("tcp", addr)
+		if err != nil {
+			for _, l := range listeners {
+				_ = l.Close()
 			}
-			log.Fatalf("bind %s: %v", addr, e)
+			log.Fatalf("listen %s: %v", addr, err)
 		}
-		srv := &http.Server{Addr: addr, Handler: serverHandler, ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 90 * time.Second, MaxHeaderBytes: 16 * 1024}
-		serverMu.Lock()
-		allServers = append(allServers, srv)
-		serverMu.Unlock()
-		go func(s *http.Server, l net.Listener) {
-			log.Printf("listening on %s", l.Addr())
-			if e := s.Serve(l); e != nil && !errors.Is(e, http.ErrServerClosed) {
-				log.Printf("listener %s: %v", s.Addr, e)
-			}
-		}(srv, listener)
+		listeners = append(listeners, ln)
+		servers = append(servers, &http.Server{Handler: g.handler(), ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 90 * time.Second, MaxHeaderBytes: 16 * 1024})
 	}
-	signals := make(chan os.Signal, 1)
-	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)
-	<-signals
-	log.Println("shutting down listeners")
-	for _, srv := range allServers {
-		_ = srv.Close()
+	for i, ln := range listeners {
+		srv := servers[i]
+		go func() {
+			if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				log.Printf("http server stopped: %v", err)
+			}
+		}()
+		log.Printf("listening on %s", ln.Addr())
+	}
+	<-ctx.Done()
+	log.Println("shutting down")
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	for _, srv := range servers {
+		_ = srv.Shutdown(shutdownCtx)
 	}
 }

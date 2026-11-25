@@ -1,0 +1,17 @@
+name: Go
+on:
+  push:
+  pull_request:
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go mod download
+      - run: gofmt -l cmd/gateway | tee /tmp/gofmt.out && test ! -s /tmp/gofmt.out
+      - run: go test -race ./...
+      - run: go vet ./...
+      - run: go build -trimpath -o gateway ./cmd/gateway
